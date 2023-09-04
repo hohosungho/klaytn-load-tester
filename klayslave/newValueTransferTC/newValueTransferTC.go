@@ -64,8 +64,14 @@ func Run() {
 	to := accGrp[rand.Int()%nAcc]
 	value := big.NewInt(int64(rand.Int() % 3))
 
+	bal, err := from.GetBalance(cli)
+	if err != nil {
+		log.Println("failed to get balance")
+	}
+	log.Printf("From: %s, balance: %s\n", from.GetAddress(), bal.Text(10))
+
 	start := boomer.Now()
-	_, _, err := from.TransferNewValueTransferTx(cli, to, value)
+	_, _, err = from.TransferNewValueTransferTx(cli, to, value)
 	elapsed := boomer.Now() - start
 
 	if err == nil {

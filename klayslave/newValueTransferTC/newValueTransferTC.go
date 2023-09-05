@@ -68,7 +68,7 @@ func Run() {
 	if err != nil {
 		log.Println("failed to get balance")
 	}
-	log.Printf("From: %s, balance: %s\n", from.GetAddress(), bal.Text(10))
+	log.Printf("From: %s, balance: %s\n", from.GetAddress().String(), bal.Text(10))
 
 	start := boomer.Now()
 	_, _, err = from.TransferNewValueTransferTx(cli, to, value)

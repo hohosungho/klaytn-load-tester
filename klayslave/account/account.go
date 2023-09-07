@@ -207,6 +207,10 @@ func (self *Account) TransferSignedTxReturnTx(withLock bool, c *client.Client, t
 			self.nonce++
 		} else {
 			fmt.Printf("Account(%v) nonce(%v) : Failed to sendTransaction: %v\n", self.GetAddress().String(), nonce, err)
+			bal, err := c.BalanceAt(ctx, self.GetAddress(), nil)
+			if err == nil {
+				fmt.Printf("Account(%v) charge: %v, balance: %v\n", self.GetAddress().String(), value.Text(10), bal.Text(10))
+			}
 		}
 		return signTx, gasPrice, err
 	}

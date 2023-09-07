@@ -228,7 +228,7 @@ func initArgs(tcNames string) {
 	activeUserPercent = *activeUserPercentPtr
 	coinbasePrivatekey = *keyPtr
 	chargeValue = new(big.Int)
-	chargeValue.Set(new(big.Int).Mul(big.NewInt(int64(chargeKLAYAmount)), big.NewInt(params.Ether)))
+	chargeValue.Set(new(big.Int).Mul(big.NewInt(int64(chargeKLAYAmount)), big.NewInt(params.Wei)))
 
 	fmt.Println("Arguments are set like the following:")
 	fmt.Printf("- Target EndPoint = %v\n", gEndpoint)
@@ -242,9 +242,13 @@ func updateChainID() {
 	account.SetChainID(big.NewInt(1337))
 }
 
-func updateGasPrice() {
+func updateGasPrice(ctx context.Context, c *client.Client) {
 	gasPrice = big.NewInt(750000000000)
-	account.SetGasPrice(gasPrice)
+	p, err := c.SuggestGasPrice(ctx)
+	if err != nil {
+		log.Fatalf("failed to get gas price")
+	}
+	account.SetGasPrice(p)
 }
 
 func updateBaseFee() {
@@ -319,9 +323,7 @@ func main() {
 	updateChainID()
 
 	// Update gasPrice
-	updateGasPrice()
-
-	gasPrice = big.NewInt(750000000000)
+	updateGasPrice(context.Background(), gCli)
 
 	// Update baseFee
 	updateBaseFee()

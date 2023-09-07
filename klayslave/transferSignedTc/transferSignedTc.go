@@ -62,7 +62,7 @@ func Run() {
 
 	from := accGrp[rand.Int()%nAcc]
 	to := accGrp[rand.Int()%nAcc]
-	value := big.NewInt(int64(rand.Int() % 3))
+	value := big.NewInt(1)
 
 	start := boomer.Now()
 	_, _, err := from.TransferSignedTx(cli, to, value)

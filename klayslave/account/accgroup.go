@@ -8,9 +8,9 @@ import (
 	"math/big"
 	"sync"
 
-	"github.com/klaytn/klaytn/blockchain/types"
-	"github.com/klaytn/klaytn/client"
-	"github.com/klaytn/klaytn/crypto"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	client "github.com/ethereum/go-ethereum/ethclient"
 )
 
 type AccLoader func(*AccGroup)
@@ -64,13 +64,13 @@ func (a *AccMgr) ChargeAccounts(ctx context.Context, cli *client.Client, coinAcc
 		log.Fatalf("Failed to sign tx: %v", err)
 	}
 
-	hash, err := cli.SendRawTransaction(ctx, signTx)
+	err = cli.SendTransaction(ctx, signTx)
 	if err != nil {
 		log.Fatalf("Failed to charge account: %v", err)
 	} else {
 		*nonce++
 	}
-	fmt.Printf("%v is charged %v peb. tx_hash=%v\n", acc.GetAddress().Hex(), 1e6, hash.String())
+	fmt.Printf("%v is charged %v peb. tx_hash=%v\n", acc.GetAddress().Hex(), 1e6, signTx.Hash().Hex())
 }
 
 func (a *AccMgr) BuildAccount(userCnt int, cnt int) {

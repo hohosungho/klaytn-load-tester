@@ -7,11 +7,11 @@ import (
 	"math/big"
 	"math/rand"
 
+	"github.com/ethereum/go-ethereum/common"
+	client "github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/klaytn/klaytn-load-tester/klayslave/account"
 	"github.com/klaytn/klaytn-load-tester/klayslave/clipool"
-	"github.com/klaytn/klaytn/client"
-	"github.com/klaytn/klaytn/common"
-	"github.com/klaytn/klaytn/params"
 	"github.com/myzhan/boomer"
 )
 
@@ -88,7 +88,7 @@ func RunSingle() (txHash common.Hash, err error) {
 	value := big.NewInt(int64(rand.Int() % 3))
 	fmt.Printf("[TC] transferSignedTc: %v, from:%v, to:%v, value:%v\n", endPoint, from.GetAddress().String(), to.GetAddress().String(), value)
 	transferedValue = big.NewInt(value.Int64())
-	expectedFee = big.NewInt(0).Mul(big.NewInt(25*params.Ston), big.NewInt(21000))
+	expectedFee = big.NewInt(0).Mul(big.NewInt(25*params.Wei), big.NewInt(21000))
 
 	balance, err := from.GetBalance(cli)
 	if err != nil {

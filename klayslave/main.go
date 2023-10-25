@@ -1,32 +1,35 @@
 package main
 
-//go:generate abigen --sol cpuHeavyTC/CPUHeavy.sol --pkg cpuHeavyTC --out cpuHeavyTC/CPUHeavy.go
-//go:generate abigen --sol userStorageTC/UserStorage.sol --pkg userStorageTC --out userStorageTC/UserStorage.go
-
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/params"
+	"github.com/klaytn/klaytn-load-tester/klayslave/account"
+	"github.com/klaytn/klaytn-load-tester/klayslave/task"
+	"github.com/klaytn/klaytn-load-tester/klayslave/transferSignedTc"
+	"github.com/myzhan/boomer"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
-
-	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/klaytn/klaytn-load-tester/klayslave/account"
-	"github.com/klaytn/klaytn-load-tester/klayslave/transferSignedTc"
-
-	"github.com/ethereum/go-ethereum/common"
-	client "github.com/ethereum/go-ethereum/ethclient"
-	"github.com/ethereum/go-ethereum/params"
-	"github.com/myzhan/boomer"
 )
 
-// sets build options from ldflags.
+//go:generate abigen --sol cpuHeavyTC/CPUHeavy.sol --pkg cpuHeavyTC --out cpuHeavyTC/CPUHeavy.go
+//go:generate abigen --sol userStorageTC/UserStorage.sol --pkg userStorageTC --out userStorageTC/UserStorage.go
+
+// Sets build options from ldflags.
 var (
 	Version   = "1.0.0"
 	Commit    string
@@ -38,16 +41,27 @@ var (
 
 var (
 	coinbasePrivatekey = ""
-	gCli               *client.Client
+	keypathsStr        string
+	keypaths           []string
+	gCli               *ethclient.Client
 	gEndpoint          string
 
 	coinbase    *account.Account
 	newCoinbase *account.Account
 
+	nUserForUnsigned    = 5 //number of virtual user account for unsigned tx
+	accGrpForUnsignedTx []*account.Account
+
 	nUserForSigned    = 5
 	accGrpForSignedTx []*account.Account
 
-	activeUserPercent = 100
+	nUserForNewAccounts  = 5
+	accGrpForNewAccounts []*account.Account
+
+	activeFromUserPercent = 100
+	activeToUserPercent   = 100
+
+	SmartContractAccount *account.Account
 
 	tcStr     string
 	tcStrList []string
@@ -55,34 +69,40 @@ var (
 	chargeValue *big.Int
 
 	gasPrice *big.Int
-	baseFee  *big.Int
+
+	aggregateTcName bool
+
+	skipCharging bool
 )
 
-type ExtendedTask struct {
-	Name    string
-	Weight  int
-	Fn      func()
-	Init    func(accs []*account.Account, endpoint string, gp *big.Int)
-	AccGrp  []*account.Account
-	EndPint string
-}
-
-func Create(endpoint string) *client.Client {
-	c, err := client.Dial(endpoint)
+func Create(endpoint string) *ethclient.Client {
+	c, err := ethclient.Dial(endpoint)
 	if err != nil {
 		log.Fatalf("Failed to connect RPC: %v", err)
 	}
 	return c
 }
 
-func prepareTestAccountsAndContracts(accGrp map[common.Address]*account.Account) {
-	// First, charging KLAY to the test accounts.
-	chargeKLAYToTestAccounts(accGrp)
+func inTheTCList(tcName string) bool {
+	for _, tc := range tcStrList {
+		if tcName == tc {
+			return true
+		}
+	}
+	return false
 }
 
-func chargeKLAYToTestAccounts(accGrp map[common.Address]*account.Account) {
-	log.Printf("Start charging KLAY to test accounts")
+func prepareTestAccountsAndContracts(accGrp map[common.Address]*account.Account) {
+	chargeEtherToTestAccounts(accGrp)
+}
 
+func chargeEtherToTestAccounts(accGrp map[common.Address]*account.Account) {
+	if skipCharging {
+		log.Println("Skip charging KLAY to test accounts")
+		return
+	}
+
+	log.Printf("Start charging KLAY to test accounts")
 	numChargedAcc := 0
 	lastFailedNum := 0
 	for _, acc := range accGrp {
@@ -91,15 +111,67 @@ func chargeKLAYToTestAccounts(accGrp map[common.Address]*account.Account) {
 			if err == nil {
 				break // Success, move to next account.
 			}
+			log.Printf("transfer failed due to err : %v, charged:%d, failed :%d, storedNonce: %d, fetchNonce: %d", err, numChargedAcc, lastFailedNum, newCoinbase.GetNonce(gCli), newCoinbase.GetNonceFromBlock(gCli))
+			numChargedAcc, lastFailedNum = estimateRemainingTimeWithErr(accGrp, numChargedAcc, lastFailedNum, err)
+		}
+		numChargedAcc++
+		if numChargedAcc%1000 == 0 {
+			log.Printf("ChargeSummary charged:%d", numChargedAcc)
+		}
+	}
+
+	log.Printf("Finished charghing KLAY to %d test account(s), Total %d transactions are sent.\n", len(accGrp), numChargedAcc)
+}
+
+type tokenChargeFunc func(initialCharge bool, c *ethclient.Client, tokenContractAddr common.Address, recipient *account.Account, value *big.Int) (*types.Transaction, *big.Int, error)
+
+// firstChargeTokenToTestAccounts charges initially generated tokens to newCoinbase account for further testing.
+// As this work is done simultaneously by different slaves, this should be done in "try and check" manner.
+func firstChargeTokenToTestAccounts(accGrp map[common.Address]*account.Account, tokenContractAddr common.Address, tokenChargeFn tokenChargeFunc, tokenChargeAmount *big.Int) {
+	log.Printf("Start initial token charging to new coinbase")
+
+	numChargedAcc := 0
+	for _, recipientAccount := range accGrp {
+		for {
+			tx, _, err := tokenChargeFn(true, gCli, tokenContractAddr, recipientAccount, tokenChargeAmount)
+			for err != nil {
+				log.Printf("Failed to execute %s: err %s", tx.Hash().String(), err.Error())
+				time.Sleep(1 * time.Second) // Mostly, the err is `txpool is full`, retry after a while.
+				tx, _, err = tokenChargeFn(true, gCli, tokenContractAddr, recipientAccount, tokenChargeAmount)
+			}
+			ctx, cancelFn := context.WithTimeout(context.Background(), 10*time.Second)
+			receipt, err := bind.WaitMined(ctx, gCli, tx)
+			cancelFn()
+			if receipt != nil {
+				break
+			}
+		}
+		numChargedAcc++
+	}
+
+	log.Printf("Finished initial token charging to %d new coinbase account(s), Total %d transactions are sent.\n", len(accGrp), numChargedAcc)
+}
+
+// chargeTokenToTestAccounts charges default token to the test accounts for testing.
+// As it is done independently among the slaves, it has simpler logic than firstChargeTokenToTestAccounts.
+func chargeTokenToTestAccounts(accGrp map[common.Address]*account.Account, tokenContractAddr common.Address, tokenChargeFn tokenChargeFunc, tokenChargeAmount *big.Int) {
+	log.Printf("Start charging tokens to test accounts")
+
+	numChargedAcc := 0
+	lastFailedNum := 0
+	for _, recipientAccount := range accGrp {
+		for {
+			_, _, err := tokenChargeFn(false, gCli, tokenContractAddr, recipientAccount, tokenChargeAmount)
+			if err == nil {
+				break // Success, move to next account.
+			}
 			numChargedAcc, lastFailedNum = estimateRemainingTime(accGrp, numChargedAcc, lastFailedNum)
 		}
 		numChargedAcc++
 	}
 
-	log.Printf("Finished charging KLAY to %d test account(s), Total %d transactions are sent.\n", len(accGrp), numChargedAcc)
+	log.Printf("Finished charging tokens to %d test account(s), Total %d transactions are sent.\n", len(accGrp), numChargedAcc)
 }
-
-type tokenChargeFunc func(initialCharge bool, c *client.Client, tokenContractAddr common.Address, recipient *account.Account, value *big.Int) (*types.Transaction, *big.Int, error)
 
 func estimateRemainingTime(accGrp map[common.Address]*account.Account, numChargedAcc, lastFailedNum int) (int, int) {
 	if lastFailedNum > 0 {
@@ -121,19 +193,103 @@ func estimateRemainingTime(accGrp map[common.Address]*account.Account, numCharge
 		lastFailedNum = numChargedAcc
 		log.Printf("Retry to charge test account #%d.\n", numChargedAcc)
 	}
+	log.Printf("Sleeping for 5 sec due to low TPS")
 	time.Sleep(5 * time.Second) // Mostly, the err is `txpool is full`, retry after a while.
+	log.Printf("Awaking from sleeping for 5 sec due to low TPS")
 	return numChargedAcc, lastFailedNum
 }
 
-func prepareAccounts() {
+func estimateRemainingTimeWithErr(accGrp map[common.Address]*account.Account, numChargedAcc, lastFailedNum int, err error) (int, int) {
+	sleep := time.Duration(0)
+	if strings.Contains(err.Error(), "txpool is full") {
+		time.Sleep(5 * time.Second)
+	}
+	if lastFailedNum > 0 {
+		// Not 1st failed cases.
+		TPS := (numChargedAcc - lastFailedNum) / 5 // TPS of only this slave during `txpool is full` situation.
+		lastFailedNum = numChargedAcc
+
+		if TPS <= 5 {
+			log.Printf("Retry to charge test account #%d. But it is too slow. %d TPS\n", numChargedAcc, TPS)
+			sleep = time.Second
+		} else {
+			remainTime := (len(accGrp) - numChargedAcc) / TPS
+			remainHour := remainTime / 3600
+			remainMinute := (remainTime % 3600) / 60
+
+			log.Printf("Retry to charge test account #%d. Estimated remaining time: %d hours %d mins later\n", numChargedAcc, remainHour, remainMinute)
+		}
+	} else {
+		// 1st failed case.
+		lastFailedNum = numChargedAcc
+		log.Printf("Retry to charge test account #%d.\n", numChargedAcc)
+	}
+	if sleep != 0 {
+		log.Printf("Sleeping for %s due to low TPS", sleep)
+		time.Sleep(sleep) // Mostly, the err is `txpool is full`, retry after a while.
+	}
+	return numChargedAcc, lastFailedNum
+}
+
+type contractDeployFunc func(c *ethclient.Client, to *account.Account, value *big.Int, humanReadable bool) (common.Address, *types.Transaction, *big.Int, error)
+
+// deploySmartContract deploys smart contracts by the number of locust slaves.
+// In other words, each slave owns its own contract for testing.
+func deploySmartContract(contractDeployFn contractDeployFunc, contractName string) *account.Account {
+	addr, lastTx, _, err := contractDeployFn(gCli, SmartContractAccount, common.Big0, false)
+	for err != nil {
+		log.Printf("Failed to deploy a %s: err %s", contractName, err.Error())
+		time.Sleep(5 * time.Second) // Mostly, the err is `txpool is full`, retry after a while.
+		addr, lastTx, _, err = contractDeployFn(gCli, SmartContractAccount, common.Big0, false)
+	}
+
+	log.Printf("Start waiting the receipt of the %s tx(%v).\n", contractName, lastTx.Hash().String())
+	bind.WaitMined(context.Background(), gCli, lastTx)
+
+	deployedContract := account.NewEthereumAccountWithAddr(addr)
+	log.Printf("%s has been deployed to : %s\n", contractName, addr.String())
+	return deployedContract
+}
+
+// deploySingleSmartContract deploys only one smart contract among the slaves.
+// It the contract is already deployed by other slave, it just calculates the address of the contract.
+func deploySingleSmartContract(erc20DeployAcc *account.Account, contractDeployFn contractDeployFunc, contractName string) *account.Account {
+	addr, lastTx, _, err := contractDeployFn(gCli, SmartContractAccount, common.Big0, false)
+	for err != nil {
+		if err == account.AlreadyDeployedErr {
+			erc20Addr := crypto.CreateAddress(erc20DeployAcc.GetAddress(), 0)
+			return account.NewEthereumAccountWithAddr(erc20Addr)
+		}
+		if strings.HasPrefix(err.Error(), "known transaction") {
+			erc20Addr := crypto.CreateAddress(erc20DeployAcc.GetAddress(), 0)
+			return account.NewEthereumAccountWithAddr(erc20Addr)
+		}
+		log.Printf("Failed to deploy a %s: err %s", contractName, err.Error())
+		time.Sleep(5 * time.Second) // Mostly, the err is `txpool is full`, retry after a while.
+		addr, lastTx, _, err = contractDeployFn(gCli, SmartContractAccount, common.Big0, false)
+	}
+
+	log.Printf("Start waiting the receipt of the %s tx(%v).\n", contractName, lastTx.Hash().String())
+	bind.WaitMined(context.Background(), gCli, lastTx)
+
+	deployedContract := account.NewEthereumAccountWithAddr(addr)
+	log.Printf("%s has been deployed to : %s\n", contractName, addr.String())
+	return deployedContract
+}
+
+func prepareAccounts() error {
 	totalChargeValue := new(big.Int)
-	totalChargeValue.Mul(chargeValue, big.NewInt(int64(nUserForSigned+1)))
+	multiply := big.NewInt(1)
+	if !skipCharging {
+		multiply = big.NewInt(int64(nUserForUnsigned + nUserForSigned + nUserForNewAccounts + 1))
+	}
+	totalChargeValue.Mul(chargeValue, multiply)
 
 	// Import coinbase Account
 	coinbase = account.GetAccountFromKey(0, coinbasePrivatekey)
 	newCoinbase = account.NewAccount(0)
 
-	if len(chargeValue.Bits()) != 0 {
+	if !skipCharging {
 		for {
 			coinbase.GetNonceFromBlock(gCli)
 			hash, _, err := coinbase.TransferSignedTx(gCli, newCoinbase, totalChargeValue)
@@ -169,7 +325,7 @@ func prepareAccounts() {
 					}
 					log.Printf("%v : charge newCoinbase waiting: %v\n", os.Getpid(), newCoinbase.GetAddress().String())
 				} else {
-					log.Printf("%v : check balance err: %v\n", os.Getpid(), err)
+					log.Printf("%v : check banalce err: %v\n", os.Getpid(), err)
 				}
 			}
 
@@ -179,41 +335,66 @@ func prepareAccounts() {
 		}
 	}
 
-	println("Signed Account Group Preparation...")
-	//bar = pb.StartNew(nUserForSigned)
-
-	for i := 0; i < nUserForSigned; i++ {
-		accGrpForSignedTx = append(accGrpForSignedTx, account.NewAccount(i))
-		fmt.Printf("%v\n", accGrpForSignedTx[i].GetAddress().String())
-		//bar.Increment()
+	var (
+		accountReader account.Reader
+		err           error
+	)
+	if keypathsStr == "" {
+		accountReader = account.NewReader()
+	} else {
+		keypaths = strings.Split(keypathsStr, ",")
+		accountReader, err = account.NewFileReader(keypaths, false)
+		if err != nil {
+			return err
+		}
 	}
+
+	// Create test account pool
+	println("Unsigned Account Group Preparation...")
+	accGrpForUnsignedTx, err = accountReader.Read(nUserForUnsigned)
+	if err != nil {
+		return err
+	}
+
+	println("Signed Account Group Preparation...")
+	accGrpForSignedTx, err = accountReader.Read(nUserForSigned)
+	if err != nil {
+		return err
+	}
+
+	println("New account group preparation...")
+	accGrpForNewAccounts, err = accountReader.Read(nUserForNewAccounts)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
-func initArgs(tcNames string) {
-	chargeKLAYAmount := 1000000000
+func initArgs(tcNames string) (terminate bool) {
+	versionPtr := flag.Bool("version", false, "print build options")
 	gEndpointPtr := flag.String("endpoint", "http://localhost:8545", "Target EndPoint")
 	nUserForSignedPtr := flag.Int("vusigned", nUserForSigned, "num of test account for signed Tx TC")
-	activeUserPercentPtr := flag.Int("activepercent", activeUserPercent, "percent of active accounts")
+	nUserForUnsignedPtr := flag.Int("vuunsigned", nUserForUnsigned, "num of test account for unsigned Tx TC")
+	activeUserPercentPtr := flag.Int("activepercent", 0, "percent of active accounts (default: 100)")
+	activeFromUserPercentPtr := flag.Int("activefrompercent", 0, "percent of active from accounts")
+	activeToUserPercentPtr := flag.Int("activetopercent", 0, "percent of active to accounts")
+
 	keyPtr := flag.String("key", "", "privatekey of coinbase")
-	versionPtr := flag.Bool("version", false, "show version number")
-	httpMaxIdleConnsPtr := flag.Int("http.maxidleconns", 100, "maximum number of idle connections in default http client")
+	chargeETHAmountPtr := flag.String("charge", "1ether", `charging amount for each test account. e.g) 100 => 100klay / 100peb / 10klay. default: 1klay`)
+	flag.StringVar(&keypathsStr, "keypaths", "", "pre-defined private key file paths for test account")
 	flag.StringVar(&tcStr, "tc", tcNames, "tasks which user want to run, multiple tasks are separated by comma.")
+	flag.BoolVar(&aggregateTcName, "aggregatetcname", false, "aggregate testcase names i.e. does not append the endpoint")
+	flag.BoolVar(&skipCharging, "skipcharging", false, "skip charging with test accounts")
 
 	flag.Parse()
 
 	if *versionPtr || (len(os.Args) >= 2 && os.Args[1] == "version") {
 		printVersion()
-		os.Exit(0)
+		return true
 	}
 
 	if *keyPtr == "" {
 		log.Fatal("key argument is not defined. You should set the key for coinbase.\n example) klaytc -key='2ef07640fd8d3f568c23185799ee92e0154bf08ccfe5c509466d1d40baca3430'")
-	}
-
-	// setup default http client.
-	if tr, ok := http.DefaultTransport.(*http.Transport); ok {
-		tr.MaxIdleConns = *httpMaxIdleConnsPtr
-		tr.MaxIdleConnsPerHost = *httpMaxIdleConnsPtr
 	}
 
 	// for TC Selection
@@ -222,38 +403,120 @@ func initArgs(tcNames string) {
 		tcStrList = strings.Split(tcStr, ",")
 	}
 
-	gEndpoint = *gEndpointPtr
+	var err error
 
+	gEndpoint = *gEndpointPtr
 	nUserForSigned = *nUserForSignedPtr
-	activeUserPercent = *activeUserPercentPtr
+	nUserForUnsigned = *nUserForUnsignedPtr
 	coinbasePrivatekey = *keyPtr
+	activeFromUserPercent, activeToUserPercent, err = parseActiveUser(*activeUserPercentPtr, *activeFromUserPercentPtr, *activeToUserPercentPtr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	parsedCharge, err := parseAmount(*chargeETHAmountPtr)
+	if err != nil {
+		log.Fatal(err)
+	}
 	chargeValue = new(big.Int)
-	chargeValue.Set(new(big.Int).Mul(big.NewInt(int64(chargeKLAYAmount)), big.NewInt(params.Wei)))
+	chargeValue.Set(parsedCharge)
 
 	fmt.Println("Arguments are set like the following:")
 	fmt.Printf("- Target EndPoint = %v\n", gEndpoint)
-	fmt.Printf("- activeUserPercent = %v\n", activeUserPercent)
+	fmt.Printf("- nUserForSigned = %v\n", nUserForSigned)
+	fmt.Printf("- nUserForUnsigned = %v\n", nUserForUnsigned)
+	fmt.Printf("- activeFromUserPercent = %v\n", activeFromUserPercent)
+	fmt.Printf("- activeToUserPercent = %v\n", activeToUserPercent)
 	fmt.Printf("- coinbasePrivatekey = %v\n", coinbasePrivatekey)
+	fmt.Printf("- charging KLAY Amount = %s\n", *chargeETHAmountPtr)
 	fmt.Printf("- tc = %v\n", tcStr)
+	return false
+}
+
+func parseActiveUser(activeUserPercent, activeFromUserPercent, activeToUserPercent int) (int, int, error) {
+	if activeUserPercent == 0 && activeFromUserPercent == 0 && activeToUserPercent == 0 {
+		return 100, 100, nil
+	}
+	// If provide --activepercent, then use --activepercent.
+	if activeUserPercent != 0 {
+		if activeFromUserPercent != 0 || activeToUserPercent != 0 {
+			return 0, 0, errors.New("require either (--activepercent) or (--activefrompercent and --activetopercent) flag")
+		}
+		return activeUserPercent, activeUserPercent, nil
+	}
+
+	if activeFromUserPercent == 0 || activeToUserPercent == 0 {
+		return 0, 0, errors.New("both --activefrompercent and --activetopercent are required")
+	}
+	return activeFromUserPercent, activeToUserPercent, nil
+}
+
+func parseAmount(val string) (*big.Int, error) {
+	idx := -1
+	for i := range val {
+		if val[i] < '0' || val[i] > '9' {
+			break
+		}
+		idx = i
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("invalid amount: %s", val)
+	}
+
+	valueStr, unit := val[0:idx+1], val[idx+1:]
+	value, err := strconv.ParseInt(valueStr, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	if unit == "" {
+		unit = "ether"
+	}
+	switch unit {
+	case "wei":
+		return new(big.Int).Mul(big.NewInt(value), big.NewInt(params.Wei)), nil
+	case "gwei":
+		return new(big.Int).Mul(big.NewInt(value), big.NewInt(params.GWei)), nil
+	case "ether":
+		return new(big.Int).Mul(big.NewInt(value), big.NewInt(params.Ether)), nil
+	default:
+		return nil, fmt.Errorf("unknown unit: %s", unit)
+	}
 }
 
 func updateChainID() {
 	fmt.Println("Updating ChainID from RPC")
-	account.SetChainID(big.NewInt(1337))
-}
+	for {
+		ctx := context.Background()
+		chainID, err := gCli.ChainID(ctx)
 
-func updateGasPrice(ctx context.Context, c *client.Client) {
-	gasPrice = big.NewInt(750000000000)
-	p, err := c.SuggestGasPrice(ctx)
-	if err != nil {
-		log.Fatalf("failed to get gas price")
+		if err == nil {
+			fmt.Println("chainID :", chainID)
+			account.SetChainID(chainID)
+			break
+		}
+		fmt.Println("Retrying updating chainID... ERR: ", err)
+
+		time.Sleep(2 * time.Second)
 	}
-	account.SetGasPrice(p)
 }
 
-func updateBaseFee() {
-	baseFee = big.NewInt(0)
-	account.SetBaseFee(baseFee)
+func updateGasPrice() {
+	gasPrice = big.NewInt(0)
+	//fmt.Println("Updating GasPrice from RPC")
+	//for {
+	//	ctx := context.Background()
+	//	gp, err := gCli.SuggestGasPrice(ctx)
+	//
+	//	if err == nil {
+	//		gasPrice = gp
+	//		fmt.Println("gas price :", gasPrice.String())
+	//		break
+	//	}
+	//	fmt.Println("Retrying updating GasPrice... ERR: ", err)
+	//
+	//	time.Sleep(2 * time.Second)
+	//}
+	account.SetGasPrice(gasPrice)
 }
 
 func setRLimit(resourceType int, val uint64) error {
@@ -274,15 +537,45 @@ func setRLimit(resourceType int, val uint64) error {
 }
 
 // initTCList initializes TCs and returns a slice of TCs.
-func initTCList() (taskSet []*ExtendedTask) {
-	taskSet = append(taskSet, &ExtendedTask{
-		Name:    "transferSignedTc",
+func initTCList() (taskSet []*task.ExtendedTask) {
+	taskSet = append(taskSet, &task.ExtendedTask{
+		Name:    "transferSignedTx",
 		Weight:  10,
 		Fn:      transferSignedTc.Run,
 		Init:    transferSignedTc.Init,
-		AccGrp:  accGrpForSignedTx,
+		AccGrp:  accGrpForSignedTx, //[:nUserForSigned/2-1],
 		EndPint: gEndpoint,
 	})
+
+	//taskSet = append(taskSet, &task.ExtendedTask{
+	//	Name:    "transferSignedWithReceiptTime",
+	//	Weight:  10,
+	//	Fn:      transferSignedWithReceiptTimeTc.Run,
+	//	Init:    transferSignedWithReceiptTimeTc.Init,
+	//	AccGrp:  accGrpForSignedTx, //[:nUserForSigned/2-1],
+	//	EndPint: gEndpoint,
+	//})
+	//
+	//taskSet = append(taskSet, &task.ExtendedTask{
+	//	Name:    "transferSignedWithReceiptTimeAsync",
+	//	Weight:  10,
+	//	Fn:      transferSignedWithReceiptTimeAsyncTc.Run,
+	//	Init:    transferSignedWithReceiptTimeAsyncTc.Init,
+	//	Stop:    transferSignedWithReceiptTimeAsyncTc.Stop,
+	//	AccGrp:  accGrpForSignedTx, //[:nUserForSigned/2-1],
+	//	EndPint: gEndpoint,
+	//})
+
+	//taskSet = append(taskSet, &task.ExtendedTask{
+	//	Name:             erc20TransferTC.Name,
+	//	Weight:           10,
+	//	Fn:               erc20TransferTC.Run,
+	//	Init:             erc20TransferTC.Init,
+	//	AccGrp:           accGrpForSignedTx,
+	//	SmartContractAcc: deploySingleSmartContract(accGrpForSignedTx[0], newCoinbase.TransferERC20, "perf-test"),
+	//	EndPint:          gEndpoint,
+	//})
+
 	return taskSet
 }
 
@@ -303,6 +596,8 @@ func printVersion() {
 }
 
 func main() {
+	// Configure http.DefaultTransport's idle connections per host to prevent closing connections.
+	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 100
 	// Call initTCList to get all TC names
 	taskSet := initTCList()
 
@@ -314,7 +609,9 @@ func main() {
 		tcNames += task.Name
 	}
 
-	initArgs(tcNames)
+	if terminate := initArgs(tcNames); terminate {
+		os.Exit(0)
+	}
 
 	// Create Cli pool
 	gCli = Create(gEndpoint)
@@ -323,18 +620,18 @@ func main() {
 	updateChainID()
 
 	// Update gasPrice
-	updateGasPrice(context.Background(), gCli)
-
-	// Update baseFee
-	updateBaseFee()
+	updateGasPrice()
 
 	// Set coinbase & Create Test Account
-	prepareAccounts()
+	if err := prepareAccounts(); err != nil {
+		log.Printf("failed to prepare account. err: %v", err)
+		os.Exit(1)
+	}
 
 	// Call initTCList again to actually define all TCs
 	taskSet = initTCList()
 
-	var filteredTask []*ExtendedTask
+	var filteredTask []*task.ExtendedTask
 
 	println("Adding tasks")
 	for _, task := range taskSet {
@@ -342,20 +639,31 @@ func main() {
 			continue
 		} else {
 			flag := false
-			for _, name := range tcStrList {
+			for _, tc := range tcStrList {
+				values := strings.Split(tc, ":")
+				name := values[0]
+				weight := 10
+				if len(values) == 2 {
+					w, err := strconv.ParseInt(values[1], 10, 32)
+					if err != nil {
+						log.Fatalf("invalid testcase name with weight: %s. err: %v", tc, err)
+					}
+					weight = int(w)
+				}
 				if name == task.Name {
 					flag = true
+					task.Weight = weight
 					break
 				}
 			}
 			if flag {
 				filteredTask = append(filteredTask, task)
-				println("=> " + task.Name + " task is added.")
+				println(fmt.Sprintf("=> %s(%d) task is added.", task.Name, task.Weight))
 			}
 		}
 	}
 
-	// Charge Accounts
+	// Charge AccGrp
 	accGrp := make(map[common.Address]*account.Account)
 	for _, task := range filteredTask {
 		for _, acc := range task.AccGrp {
@@ -366,23 +674,7 @@ func main() {
 		}
 
 	}
-
-	if len(chargeValue.Bits()) != 0 {
-		prepareTestAccountsAndContracts(accGrp)
-	}
-
-	// After charging accounts, cut the slice to the desired length, calculated by ActiveAccountPercent.
-	for _, task := range filteredTask {
-		if activeUserPercent > 100 {
-			log.Fatalf("ActiveAccountPercent should be less than or equal to 100, but it is %v", activeUserPercent)
-		}
-		numActiveAccounts := len(task.AccGrp) * activeUserPercent / 100
-		// Not to assign 0 account for some cases.
-		if numActiveAccounts == 0 {
-			numActiveAccounts = 1
-		}
-		task.AccGrp = task.AccGrp[:numActiveAccounts]
-	}
+	prepareTestAccountsAndContracts(accGrp)
 
 	if len(filteredTask) == 0 {
 		log.Fatal("No Tc is set. Please set TcList. \nExample argument) -tc='" + tcNames + "'")
@@ -390,15 +682,32 @@ func main() {
 
 	println("Initializing tasks")
 	var filteredBoomerTask []*boomer.Task
-	for _, task := range filteredTask {
-		task.Init(task.AccGrp, task.EndPint, gasPrice)
-		filteredBoomerTask = append(filteredBoomerTask, &boomer.Task{task.Weight, task.Fn, task.Name})
-		println("=> " + task.Name + " task is initialized.")
+	for _, t := range filteredTask {
+		t.Init(task.Params{
+			AccGrp:          t.AccGrp,
+			Endpoint:        t.EndPint,
+			GasPrice:        gasPrice,
+			AggregateTcName: aggregateTcName,
+			ActiveFromUsers: len(t.AccGrp) * activeFromUserPercent / 100,
+			ActiveToUsers:   len(t.AccGrp) * activeToUserPercent / 100,
+		})
+		filteredBoomerTask = append(filteredBoomerTask, &boomer.Task{t.Weight, t.Fn, t.Name})
+		println("=> " + t.Name + " task is initialized.")
 	}
 
 	setRLimit(syscall.RLIMIT_NOFILE, 1024*400)
 
+	boomer.Events.Subscribe("boomer:stop", func() {
+		for _, t := range filteredTask {
+			if t.Stop != nil {
+				t.Stop()
+			}
+		}
+	})
+
 	// Locust Slave Run
 	boomer.Run(filteredBoomerTask...)
 	//boomer.Run(cpuHeavyTx)
+
+	log.Printf("Terminate boomer")
 }

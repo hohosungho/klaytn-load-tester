@@ -1,15 +1,14 @@
 package transferSignedTc
 
 import (
-	"errors"
 	"fmt"
+	"github.com/klaytn/klaytn-load-tester/klayslave/task"
 	"log"
 	"math/big"
 	"math/rand"
+	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	client "github.com/ethereum/go-ethereum/ethclient"
-	"github.com/ethereum/go-ethereum/params"
 	"github.com/klaytn/klaytn-load-tester/klayslave/account"
 	"github.com/klaytn/klaytn-load-tester/klayslave/clipool"
 	"github.com/myzhan/boomer"
@@ -18,11 +17,14 @@ import (
 const Name = "transferSignedTx"
 
 var (
-	endPoint string
-	nAcc     int
-	accGrp   []*account.Account
-	cliPool  clipool.ClientPool
-	gasPrice *big.Int
+	endPoint          string
+	reportName        string
+	failureReportName string
+	fromActiveUser    int
+	toActiveUser      int
+	accGrp            []*account.Account
+	cliPool           clipool.ClientPool
+	gasPrice          *big.Int
 
 	// multinode tester
 	transferedValue *big.Int
@@ -35,10 +37,15 @@ var (
 	prevBalanceTo *big.Int
 )
 
-func Init(accs []*account.Account, endpoint string, gp *big.Int) {
-	gasPrice = gp
+func Init(params task.Params) {
+	gasPrice = params.GasPrice
 
-	endPoint = endpoint
+	endPoint = params.Endpoint
+	reportName = "signedtransfer"
+	if !params.AggregateTcName {
+		reportName += " to " + endPoint
+	}
+	failureReportName = reportName + "_fail"
 
 	cliCreate := func() interface{} {
 		c, err := client.Dial(endPoint)
@@ -50,105 +57,32 @@ func Init(accs []*account.Account, endpoint string, gp *big.Int) {
 
 	cliPool.Init(20, 300, cliCreate)
 
-	for _, acc := range accs {
+	for _, acc := range params.AccGrp {
 		accGrp = append(accGrp, acc)
 	}
-
-	nAcc = len(accGrp)
+	fromActiveUser = params.ActiveFromUsers
+	toActiveUser = params.ActiveToUsers
 }
 
 func Run() {
 	cli := cliPool.Alloc().(*client.Client)
 
-	from := accGrp[rand.Int()%nAcc]
-	to := accGrp[rand.Int()%nAcc]
-	value := big.NewInt(1)
+	from := accGrp[rand.Int()%fromActiveUser]
+	to := accGrp[rand.Int()%toActiveUser]
+	value := big.NewInt(int64(rand.Intn(1000) % 3))
 
-	start := boomer.Now()
+	start := time.Now()
 	_, _, err := from.TransferSignedTx(cli, to, value)
-	elapsed := boomer.Now() - start
+	elapsed := time.Since(start)
+	elapsedMillis := elapsed.Milliseconds()
+	if elapsedMillis == 0 {
+		fmt.Printf("found zero elapsed ms. %d ns\n", elapsed.Nanoseconds())
+	}
 
 	if err == nil {
-		boomer.Events.Publish("request_success", "http", "signedtransfer"+" to "+endPoint, elapsed, int64(10))
+		boomer.RecordSuccess("http", reportName, elapsedMillis, int64(10))
 		cliPool.Free(cli)
 	} else {
-		boomer.Events.Publish("request_failure", "http", "signedtransfer"+" to "+endPoint, elapsed, err.Error())
+		boomer.RecordFailure("http", failureReportName, elapsedMillis, err.Error())
 	}
-}
-
-func RunSingle() (txHash common.Hash, err error) {
-	cli := cliPool.Alloc().(*client.Client)
-	defer cliPool.Free(cli)
-
-	fromIdx := rand.Int() % nAcc
-	toIdx := (fromIdx + 1) % nAcc
-
-	from := accGrp[fromIdx]
-	to := accGrp[toIdx]
-	value := big.NewInt(int64(rand.Int() % 3))
-	fmt.Printf("[TC] transferSignedTc: %v, from:%v, to:%v, value:%v\n", endPoint, from.GetAddress().String(), to.GetAddress().String(), value)
-	transferedValue = big.NewInt(value.Int64())
-	expectedFee = big.NewInt(0).Mul(big.NewInt(25*params.Wei), big.NewInt(21000))
-
-	balance, err := from.GetBalance(cli)
-	if err != nil {
-		return common.Hash{}, err
-	}
-	fromAccount = from
-	prevBalanceFrom = big.NewInt(balance.Int64())
-	fmt.Printf("From:%v, balance:%v\n", fromAccount.GetAddress().String(), prevBalanceFrom.Int64())
-
-	balance, err = to.GetBalance(cli)
-	if err != nil {
-		return common.Hash{}, err
-	}
-	toAccount = to
-	prevBalanceTo = big.NewInt(balance.Int64())
-	fmt.Printf("To:%v, balance:%v\n", toAccount.GetAddress().String(), prevBalanceTo.Int64())
-
-	txHash, _, err = from.TransferSignedTx(cli, to, value)
-	if err != nil {
-		return common.Hash{}, err
-	}
-
-	return txHash, err
-}
-
-// CheckResult returns true and nil error, if expected results are observed.
-// Otherewise returns false and error.
-func CheckResult() (bool, error) {
-	cli := cliPool.Alloc().(*client.Client)
-	defer cliPool.Free(cli)
-
-	balance, err := fromAccount.GetBalance(cli)
-	if err != nil {
-		return false, err
-	}
-	expectedBalance := big.NewInt(0)
-	expectedBalance.Sub(prevBalanceFrom, transferedValue)
-	expectedBalance.Sub(expectedBalance, expectedFee)
-	// fmt.Printf("prevBalanceFrom=%v, transferedValue=%v, expectedFee=%v\n", prevBalanceFrom.Int64(), transferedValue.Int64(), expectedFee.Int64())
-
-	if expectedBalance.Int64() != balance.Int64() {
-		fmt.Printf("[FAILED] From account address=%v, Expected balance=%v, Actual balance=%v\n", fromAccount.GetAddress().String(), expectedBalance.Int64(), balance.Int64())
-		return false, errors.New("Balance mismatched!")
-	} else {
-		fmt.Printf("[PASSED] From account address=%v, Expected balance=%v, Actual balance=%v\n", fromAccount.GetAddress().String(), expectedBalance.Int64(), balance.Int64())
-	}
-
-	balance, err = toAccount.GetBalance(cli)
-	if err != nil {
-		return false, err
-	}
-	expectedBalance = big.NewInt(0)
-	expectedBalance.Add(prevBalanceTo, transferedValue)
-	fmt.Printf("prevBalanceTo=%v, transferedValue=%v\n", prevBalanceTo.Int64(), transferedValue.Int64())
-	if expectedBalance.Int64() != balance.Int64() {
-		fmt.Printf("[FAILED] To account address=%v, Expected balance=%v, Actual balance=%v\n", toAccount.GetAddress().String(), expectedBalance.Int64(), balance.Int64())
-		return false, errors.New("Balance mismatched!")
-	} else {
-		fmt.Printf("[PASSED] To account address=%v, Expected balance=%v, Actual balance=%v\n", toAccount.GetAddress().String(), expectedBalance.Int64(), balance.Int64())
-	}
-
-	return true, err
 }

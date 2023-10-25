@@ -9,6 +9,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,7 @@ var (
 	chainID  *big.Int
 	baseFee  *big.Int
 )
+var AlreadyDeployedErr = errors.New("contract seems to already have been deployed")
 
 type Account struct {
 	id         int
@@ -201,7 +203,7 @@ func (self *Account) TransferSignedTxReturnTx(withLock bool, c *client.Client, t
 
 	err = c.SendTransaction(ctx, signTx)
 	if err != nil {
-		if err.Error() == blockchain.ErrNonceTooLow.Error() {
+		if strings.EqualFold(err.Error(), blockchain.ErrNonceTooLow.Error()) {
 			fmt.Printf("Account(%v) nonce(%v) : Failed to sendTransaction: %v\n", self.GetAddress().String(), nonce, err)
 			fmt.Printf("Account(%v) nonce is added to %v\n", self.GetAddress().String(), nonce+1)
 			self.nonce++
@@ -230,4 +232,26 @@ func (a *Account) CheckBalance(expectedBalance *big.Int, cli *client.Client) err
 	}
 
 	return nil
+}
+
+func NewEthereumAccountWithAddr(addr common.Address) *Account {
+	acc, err := crypto.GenerateKey()
+	if err != nil {
+		log.Fatalf("crypto.GenerateKey() : Failed to generateKey %v", err)
+	}
+
+	testKey := hex.EncodeToString(crypto.FromECDSA(acc))
+	tAcc := Account{
+		0,
+		[]*ecdsa.PrivateKey{acc},
+		[]string{testKey},
+		addr,
+		0,
+		big.NewInt(0),
+		sync.Mutex{},
+		//make(TransactionMap),
+	}
+
+	return &tAcc
+
 }

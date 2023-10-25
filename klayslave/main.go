@@ -12,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/klaytn/klaytn-load-tester/klayslave/account"
+	"github.com/klaytn/klaytn-load-tester/klayslave/erc20TransferTC"
 	"github.com/klaytn/klaytn-load-tester/klayslave/task"
 	"github.com/klaytn/klaytn-load-tester/klayslave/transferSignedTc"
 	"github.com/myzhan/boomer"
@@ -28,6 +29,9 @@ import (
 
 //go:generate abigen --sol cpuHeavyTC/CPUHeavy.sol --pkg cpuHeavyTC --out cpuHeavyTC/CPUHeavy.go
 //go:generate abigen --sol userStorageTC/UserStorage.sol --pkg userStorageTC --out userStorageTC/UserStorage.go
+
+// Dedicated and fixed private key used to deploy a smart contract for ERC20 and ERC721 value transfer performance test.
+var ERC20DeployPrivateKeyStr = "eb2c84d41c639178ff26a81f488c196584d678bb1390cc20a3aeb536f3969a98"
 
 // Sets build options from ldflags.
 var (
@@ -94,6 +98,7 @@ func inTheTCList(tcName string) bool {
 
 func prepareTestAccountsAndContracts(accGrp map[common.Address]*account.Account) {
 	chargeEtherToTestAccounts(accGrp)
+	prepareERC20Transfer(accGrp)
 }
 
 func chargeEtherToTestAccounts(accGrp map[common.Address]*account.Account) {
@@ -121,6 +126,22 @@ func chargeEtherToTestAccounts(accGrp map[common.Address]*account.Account) {
 	}
 
 	log.Printf("Finished charghing KLAY to %d test account(s), Total %d transactions are sent.\n", len(accGrp), numChargedAcc)
+}
+
+func prepareERC20Transfer(accGrp map[common.Address]*account.Account) {
+	if !inTheTCList(erc20TransferTC.Name) {
+		return
+	}
+	erc20DeployAcc := account.GetAccountFromKey(0, ERC20DeployPrivateKeyStr)
+	log.Printf("prepareERC20Transfer", "addr", erc20DeployAcc.GetAddress().String())
+	chargeEtherToTestAccounts(map[common.Address]*account.Account{erc20DeployAcc.GetAddress(): erc20DeployAcc})
+
+	// A smart contract for ERC20 value transfer performance TC.
+	erc20TransferTC.SmartContractAccount = deploySingleSmartContract(erc20DeployAcc, erc20DeployAcc.DeployERC20, "ERC20 Performance Test Contract")
+	newCoinBaseAccountMap := map[common.Address]*account.Account{newCoinbase.GetAddress(): newCoinbase}
+	firstChargeTokenToTestAccounts(newCoinBaseAccountMap, erc20TransferTC.SmartContractAccount.GetAddress(), erc20DeployAcc.TransferERC20, big.NewInt(1e11))
+
+	chargeTokenToTestAccounts(accGrp, erc20TransferTC.SmartContractAccount.GetAddress(), newCoinbase.TransferERC20, big.NewInt(1e4))
 }
 
 type tokenChargeFunc func(initialCharge bool, c *ethclient.Client, tokenContractAddr common.Address, recipient *account.Account, value *big.Int) (*types.Transaction, *big.Int, error)
@@ -566,15 +587,14 @@ func initTCList() (taskSet []*task.ExtendedTask) {
 	//	EndPint: gEndpoint,
 	//})
 
-	//taskSet = append(taskSet, &task.ExtendedTask{
-	//	Name:             erc20TransferTC.Name,
-	//	Weight:           10,
-	//	Fn:               erc20TransferTC.Run,
-	//	Init:             erc20TransferTC.Init,
-	//	AccGrp:           accGrpForSignedTx,
-	//	SmartContractAcc: deploySingleSmartContract(accGrpForSignedTx[0], newCoinbase.TransferERC20, "perf-test"),
-	//	EndPint:          gEndpoint,
-	//})
+	taskSet = append(taskSet, &task.ExtendedTask{
+		Name:    erc20TransferTC.Name,
+		Weight:  10,
+		Fn:      erc20TransferTC.Run,
+		Init:    erc20TransferTC.Init,
+		AccGrp:  accGrpForSignedTx,
+		EndPint: gEndpoint,
+	})
 
 	return taskSet
 }

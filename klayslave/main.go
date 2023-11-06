@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	blockchain "github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/klaytn/klaytn-load-tester/klayslave/account"
 	"github.com/klaytn/klaytn-load-tester/klayslave/erc20TransferTC"
+	"github.com/klaytn/klaytn-load-tester/klayslave/erc20TransferWithReceiptTimeTC"
 	"github.com/klaytn/klaytn-load-tester/klayslave/task"
 	"github.com/klaytn/klaytn-load-tester/klayslave/transferSignedTc"
 	"github.com/myzhan/boomer"
@@ -23,6 +26,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -87,12 +91,15 @@ func Create(endpoint string) *ethclient.Client {
 	return c
 }
 
-func inTheTCList(tcName string) bool {
-	for _, tc := range tcStrList {
-		if tcName == tc {
-			return true
+func inTheTCList(tcNames ...string) bool {
+	for _, tcName := range tcNames {
+		for _, tc := range tcStrList {
+			if tcName == tc {
+				return true
+			}
 		}
 	}
+
 	return false
 }
 
@@ -129,7 +136,7 @@ func chargeEtherToTestAccounts(accGrp map[common.Address]*account.Account) {
 }
 
 func prepareERC20Transfer(accGrp map[common.Address]*account.Account) {
-	if !inTheTCList(erc20TransferTC.Name) {
+	if !inTheTCList(erc20TransferTC.Name, erc20TransferWithReceiptTimeTC.Name) {
 		return
 	}
 	erc20DeployAcc := account.GetAccountFromKey(0, ERC20DeployPrivateKeyStr)
@@ -139,9 +146,9 @@ func prepareERC20Transfer(accGrp map[common.Address]*account.Account) {
 	// A smart contract for ERC20 value transfer performance TC.
 	erc20TransferTC.SmartContractAccount = deploySingleSmartContract(erc20DeployAcc, erc20DeployAcc.DeployERC20, "ERC20 Performance Test Contract")
 	newCoinBaseAccountMap := map[common.Address]*account.Account{newCoinbase.GetAddress(): newCoinbase}
-	firstChargeTokenToTestAccounts(newCoinBaseAccountMap, erc20TransferTC.SmartContractAccount.GetAddress(), erc20DeployAcc.TransferERC20, big.NewInt(1e11))
+	firstChargeTokenToTestAccounts(newCoinBaseAccountMap, erc20TransferTC.SmartContractAccount.GetAddress(), erc20DeployAcc.TransferERC20, big.NewInt(1e10))
 
-	chargeTokenToTestAccounts(accGrp, erc20TransferTC.SmartContractAccount.GetAddress(), newCoinbase.TransferERC20, big.NewInt(1e4))
+	chargeTokenToTestAccounts(accGrp, erc20TransferTC.SmartContractAccount.GetAddress(), newCoinbase.TransferERC20, big.NewInt(1e3))
 }
 
 type tokenChargeFunc func(initialCharge bool, c *ethclient.Client, tokenContractAddr common.Address, recipient *account.Account, value *big.Int) (*types.Transaction, *big.Int, error)
@@ -160,16 +167,21 @@ func firstChargeTokenToTestAccounts(accGrp map[common.Address]*account.Account, 
 				time.Sleep(1 * time.Second) // Mostly, the err is `txpool is full`, retry after a while.
 				tx, _, err = tokenChargeFn(true, gCli, tokenContractAddr, recipientAccount, tokenChargeAmount)
 			}
-			ctx, cancelFn := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancelFn := context.WithTimeout(context.Background(), 20*time.Second)
 			receipt, err := bind.WaitMined(ctx, gCli, tx)
+			if err != nil {
+				log.Printf("Failed to wait. txhash: %s err %s", tx.Hash().String(), err.Error())
+			}
 			cancelFn()
 			if receipt != nil {
+				if receipt.Status == 0 {
+					log.Println("Failed to charge accounts")
+				}
 				break
 			}
 		}
 		numChargedAcc++
 	}
-
 	log.Printf("Finished initial token charging to %d new coinbase account(s), Total %d transactions are sent.\n", len(accGrp), numChargedAcc)
 }
 
@@ -180,17 +192,33 @@ func chargeTokenToTestAccounts(accGrp map[common.Address]*account.Account, token
 
 	numChargedAcc := 0
 	lastFailedNum := 0
+	wg := sync.WaitGroup{}
 	for _, recipientAccount := range accGrp {
-		for {
-			_, _, err := tokenChargeFn(false, gCli, tokenContractAddr, recipientAccount, tokenChargeAmount)
-			if err == nil {
-				break // Success, move to next account.
+		wg.Add(1)
+		go func(acc *account.Account) {
+			for {
+				tx, _, err := tokenChargeFn(false, gCli, tokenContractAddr, acc, tokenChargeAmount)
+				ctx, cancelFn := context.WithTimeout(context.Background(), 20*time.Second)
+				receipt, err := bind.WaitMined(ctx, gCli, tx)
+				if err != nil {
+					log.Printf("Failed to wait. txhash: %s err %s", tx.Hash().String(), err.Error())
+				}
+				cancelFn()
+				if receipt != nil {
+					if receipt.Status == 0 {
+						log.Println("Failed to charge accounts")
+					}
+				}
+				if err == nil {
+					wg.Done()
+					break // Success, move to next account.
+				}
+				numChargedAcc, lastFailedNum = estimateRemainingTime(accGrp, numChargedAcc, lastFailedNum)
 			}
-			numChargedAcc, lastFailedNum = estimateRemainingTime(accGrp, numChargedAcc, lastFailedNum)
-		}
+		}(recipientAccount)
 		numChargedAcc++
 	}
-
+	wg.Wait()
 	log.Printf("Finished charging tokens to %d test account(s), Total %d transactions are sent.\n", len(accGrp), numChargedAcc)
 }
 
@@ -276,25 +304,25 @@ func deploySmartContract(contractDeployFn contractDeployFunc, contractName strin
 // It the contract is already deployed by other slave, it just calculates the address of the contract.
 func deploySingleSmartContract(erc20DeployAcc *account.Account, contractDeployFn contractDeployFunc, contractName string) *account.Account {
 	addr, lastTx, _, err := contractDeployFn(gCli, SmartContractAccount, common.Big0, false)
+	log.Println("contract address: " + addr.Hex())
 	for err != nil {
 		if err == account.AlreadyDeployedErr {
 			erc20Addr := crypto.CreateAddress(erc20DeployAcc.GetAddress(), 0)
 			return account.NewEthereumAccountWithAddr(erc20Addr)
 		}
-		if strings.HasPrefix(err.Error(), "known transaction") {
-			erc20Addr := crypto.CreateAddress(erc20DeployAcc.GetAddress(), 0)
-			return account.NewEthereumAccountWithAddr(erc20Addr)
+		if strings.HasPrefix(err.Error(), "Known transaction") || strings.EqualFold(err.Error(), blockchain.ErrNonceTooLow.Error()) || strings.EqualFold(err.Error(), txpool.ErrReplaceUnderpriced.Error()) {
+			log.Printf("Failed to deploy a %s: err %s", contractName, err.Error())
+			time.Sleep(5 * time.Second) // Mostly, the err is `txpool is full`, retry after a while.
+			addr, lastTx, _, err = contractDeployFn(gCli, SmartContractAccount, common.Big0, false)
 		}
-		log.Printf("Failed to deploy a %s: err %s", contractName, err.Error())
-		time.Sleep(5 * time.Second) // Mostly, the err is `txpool is full`, retry after a while.
-		addr, lastTx, _, err = contractDeployFn(gCli, SmartContractAccount, common.Big0, false)
 	}
 
 	log.Printf("Start waiting the receipt of the %s tx(%v).\n", contractName, lastTx.Hash().String())
-	bind.WaitMined(context.Background(), gCli, lastTx)
+	bind.WaitDeployed(context.Background(), gCli, lastTx)
 
 	deployedContract := account.NewEthereumAccountWithAddr(addr)
 	log.Printf("%s has been deployed to : %s\n", contractName, addr.String())
+
 	return deployedContract
 }
 
@@ -593,6 +621,17 @@ func initTCList() (taskSet []*task.ExtendedTask) {
 		Fn:      erc20TransferTC.Run,
 		Init:    erc20TransferTC.Init,
 		AccGrp:  accGrpForSignedTx,
+		Stop:    erc20TransferTC.Stop,
+		EndPint: gEndpoint,
+	})
+
+	taskSet = append(taskSet, &task.ExtendedTask{
+		Name:    erc20TransferWithReceiptTimeTC.Name,
+		Weight:  10,
+		Fn:      erc20TransferWithReceiptTimeTC.Run,
+		Init:    erc20TransferWithReceiptTimeTC.Init,
+		AccGrp:  accGrpForSignedTx,
+		Stop:    erc20TransferWithReceiptTimeTC.Stop,
 		EndPint: gEndpoint,
 	})
 

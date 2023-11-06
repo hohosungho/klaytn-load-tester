@@ -1,6 +1,6 @@
 ARG SRC_DIR=/go/src/github.com/klaytn/klaytn-load-tester
 
-FROM golang:1.18-buster as builder
+FROM golang:1.19-buster as builder
 ARG SRC_DIR
 
 RUN apt update && apt install -y make

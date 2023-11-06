@@ -78,11 +78,18 @@ func Run() {
 	if elapsedMillis == 0 {
 		fmt.Printf("found zero elapsed ms. %d ns\n", elapsed.Nanoseconds())
 	}
+	//if err != nil {
+	//	boomer.RecordFailure("http", failureReportName, elapsedMillis, err.Error())
+	//}
 
+	//ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	//defer cancel()
+
+	//_, err = bind.WaitMined(ctx, cli, tx)
 	if err == nil {
 		boomer.RecordSuccess("http", reportName, elapsedMillis, int64(10))
 		cliPool.Free(cli)
 	} else {
-		boomer.RecordFailure("http", failureReportName, elapsedMillis, err.Error())
+		boomer.RecordFailure("http", failureReportName+" timeout", elapsedMillis, err.Error())
 	}
 }

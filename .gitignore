@@ -31,3 +31,5 @@ _testmain.go
 klayslave/klayslave
 build/bin/
 nodes
+/venv/
+/log-inspect/

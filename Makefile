@@ -11,3 +11,7 @@ endef
 build:
 	mkdir -p ./build/bin
 	go build -ldflags=${LD_FLAGS} -a -o ./build/bin/klayslave ./klayslave
+
+build.linux:
+	mkdir -p ./build/bin
+	GOARCH=amd64 GOOS=linux go build -ldflags=${LD_FLAGS} -a -o ./build/bin/klayslave ./klayslave

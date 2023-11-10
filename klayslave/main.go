@@ -16,6 +16,7 @@ import (
 	"github.com/klaytn/klaytn-load-tester/klayslave/account"
 	"github.com/klaytn/klaytn-load-tester/klayslave/erc20TransferTC"
 	"github.com/klaytn/klaytn-load-tester/klayslave/erc20TransferWithReceiptTimeTC"
+	"github.com/klaytn/klaytn-load-tester/klayslave/receiptChecker"
 	"github.com/klaytn/klaytn-load-tester/klayslave/task"
 	"github.com/klaytn/klaytn-load-tester/klayslave/transferSignedTc"
 	"github.com/myzhan/boomer"
@@ -631,7 +632,6 @@ func initTCList() (taskSet []*task.ExtendedTask) {
 		Fn:      erc20TransferWithReceiptTimeTC.Run,
 		Init:    erc20TransferWithReceiptTimeTC.Init,
 		AccGrp:  accGrpForSignedTx,
-		Stop:    erc20TransferWithReceiptTimeTC.Stop,
 		EndPint: gEndpoint,
 	})
 
@@ -691,6 +691,16 @@ func main() {
 	taskSet = initTCList()
 
 	var filteredTask []*task.ExtendedTask
+	maxRPSFlag := flag.Lookup("max-rps")
+	var maxRPS int
+	if maxRPSFlag != nil {
+		maxRPSStr := maxRPSFlag.Value.String()
+		var err error
+		maxRPS, err = strconv.Atoi(maxRPSStr)
+		if err != nil {
+			log.Fatalf("failed to get max rps from value %v", err)
+		}
+	}
 
 	println("Adding tasks")
 	for _, task := range taskSet {
@@ -742,14 +752,20 @@ func main() {
 	println("Initializing tasks")
 	var filteredBoomerTask []*boomer.Task
 	for _, t := range filteredTask {
-		t.Init(task.Params{
+		p := task.Params{
 			AccGrp:          t.AccGrp,
 			Endpoint:        t.EndPint,
 			GasPrice:        gasPrice,
 			AggregateTcName: aggregateTcName,
 			ActiveFromUsers: len(t.AccGrp) * activeFromUserPercent / 100,
 			ActiveToUsers:   len(t.AccGrp) * activeToUserPercent / 100,
-		})
+		}
+		if t.NeedReceiptChecker {
+			p.ReceiptChecker = receiptChecker.NewDefaultReceiptChecker(
+				context.Background(), maxRPS, t.Name, t.EndPint)
+		}
+		t.Init(p)
+
 		filteredBoomerTask = append(filteredBoomerTask, &boomer.Task{t.Weight, t.Fn, t.Name})
 		println("=> " + t.Name + " task is initialized.")
 	}
